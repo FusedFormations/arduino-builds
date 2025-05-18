@@ -1,0 +1,48 @@
+name: Compile Arduino Sketches
+
+on:
+  push:
+    paths:
+      - 'sketches/**.ino'
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+        
+      - name: Install Arduino Core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+          
+      - name: Find and compile sketches
+        run: |
+          mkdir -p builds
+          for sketch in sketches/*.ino; do
+            if [ -f "$sketch" ]; then
+              echo "Compiling $sketch"
+              sketch_name=$(basename "$sketch" .ino)
+              sketch_dir=$(dirname "$sketch")
+              
+              # Compile the sketch
+              arduino-cli compile --fqbn arduino:avr:uno "$sketch" --output-dir "builds/$sketch_name"
+              
+              # Add timestamp to build info
+              echo "Compiled on $(date)" > "builds/$sketch_name/build_info.txt"
+            fi
+          done
+          
+      - name: Commit compiled files
+        run: |
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add builds/
+          git commit -m "Add compiled sketches [skip ci]" || echo "No changes to commit"
+          git push
