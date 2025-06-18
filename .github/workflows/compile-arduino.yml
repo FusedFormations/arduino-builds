@@ -1,4 +1,4 @@
-name: Compile Arduino Sketches
+name: Compile Arduino with Auto-Cleanup
 
 on:
   push:
@@ -25,17 +25,31 @@ jobs:
         arduino-cli core update-index
         arduino-cli core install arduino:avr
     
-    - name: Compile sketches
+    - name: Clean up old builds
       run: |
-        # Create builds directory
+        # Remove test builds older than 1 hour
+        if [ -d "builds" ]; then
+          find builds -name "test_*" -type d -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+          
+          # Keep only the 10 most recent builds for each sketch
+          for sketch_type in $(find builds -maxdepth 1 -type d -name "*" ! -name "builds" | sed 's|builds/||' | grep -v "test_" | sort -u); do
+            # Count builds for this sketch type
+            count=$(find builds -name "${sketch_type}*" -type d | wc -l)
+            if [ $count -gt 10 ]; then
+              # Remove oldest ones
+              find builds -name "${sketch_type}*" -type d | sort | head -n -10 | xargs rm -rf
+            fi
+          done
+        fi
+    
+    - name: Compile sketch
+      run: |
         mkdir -p builds
         
-        # Handle repository dispatch
         if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
           SKETCH_NAME="${{ github.event.client_payload.filename }}"
           echo "Compiling specific sketch: $SKETCH_NAME"
           
-          # Find the sketch file
           SKETCH_PATH=$(find sketches -name "${SKETCH_NAME}.ino" -type f | head -1)
           
           if [ -z "$SKETCH_PATH" ]; then
@@ -43,14 +57,11 @@ jobs:
             exit 1
           fi
           
-          # Compile the specific sketch
           echo "Found sketch at: $SKETCH_PATH"
           SKETCH_DIR=$(dirname "$SKETCH_PATH")
           
-          # Arduino CLI needs the sketch in a folder with the same name
           mkdir -p "builds/${SKETCH_NAME}"
           
-          # Compile and export binaries
           arduino-cli compile \
             --fqbn arduino:avr:uno \
             "$SKETCH_DIR" \
@@ -58,57 +69,50 @@ jobs:
             --export-binaries \
             --verbose
           
-          # Rename the hex file to a consistent format
           if [ -f "builds/${SKETCH_NAME}/${SKETCH_NAME}.ino.hex" ]; then
             cp "builds/${SKETCH_NAME}/${SKETCH_NAME}.ino.hex" "builds/${SKETCH_NAME}/${SKETCH_NAME}.hex"
             echo "Created: builds/${SKETCH_NAME}/${SKETCH_NAME}.hex"
           fi
-          
-        else
-          # Compile all sketches
-          echo "Compiling all sketches..."
-          
-          for sketch_dir in sketches/*/; do
-            if [ -d "$sketch_dir" ]; then
-              sketch_name=$(basename "$sketch_dir")
-              echo "Compiling: $sketch_name"
-              
-              mkdir -p "builds/$sketch_name"
-              
-              arduino-cli compile \
-                --fqbn arduino:avr:uno \
-                "$sketch_dir" \
-                --output-dir "builds/$sketch_name" \
-                --export-binaries \
-                --verbose || echo "Failed to compile $sketch_name"
-              
-              # Rename for consistency
-              if [ -f "builds/$sketch_name/${sketch_name}.ino.hex" ]; then
-                cp "builds/$sketch_name/${sketch_name}.ino.hex" "builds/$sketch_name/${sketch_name}.hex"
-              fi
-            fi
-          done
         fi
         
-        # List all hex files
         echo "Generated hex files:"
-        find builds -name "*.hex" -type f
+        find builds -name "*.hex" -type f | head -20
     
     - name: Commit compiled files
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
+        
+        # Pull and rebase to get latest changes
+        git pull origin main --rebase --strategy-option=theirs
+        
+        # Add changes
         git add builds/
+        
+        # Also stage deletions from cleanup
+        git add -A builds/
+        
         if git diff --staged --quiet; then
           echo "No changes to commit"
         else
-          git commit -m "Add compiled firmware for ${{ github.event.client_payload.filename || 'sketches' }} [skip ci]"
-          git push
+          git commit -m "Compiled ${{ github.event.client_payload.filename || 'sketches' }} [skip ci]"
+          
+          # Push with retry
+          for i in {1..5}; do
+            if git push origin main; then
+              echo "Successfully pushed"
+              break
+            else
+              echo "Push attempt $i failed, pulling and retrying..."
+              git pull origin main --rebase --strategy-option=theirs
+              sleep $((i * 2))
+            fi
+          done
         fi
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: compiled-firmware
+        name: hex-files-${{ github.run_number }}
         path: builds/**/*.hex
-        retention-days: 7
+        retention-days: 1
