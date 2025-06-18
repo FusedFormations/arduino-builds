@@ -1,7 +1,9 @@
-name: Simple Arduino Compilation
+name: Compile Arduino Sketches
 
 on:
   push:
+    paths:
+      - 'sketches/**/*.ino'
   repository_dispatch:
     types: [compile-arduino]
 
@@ -11,51 +13,102 @@ jobs:
     
     steps:
     - uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
     
     - name: Install Arduino CLI
       run: |
         curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
         sudo mv bin/arduino-cli /usr/local/bin/arduino-cli
+        arduino-cli version
         arduino-cli core update-index
         arduino-cli core install arduino:avr
     
-    - name: Find and compile sketches
+    - name: Compile sketches
       run: |
+        # Create builds directory
         mkdir -p builds
         
-        # Find all .ino files
-        for ino_file in $(find . -name "*.ino" -type f); do
-          echo "Found: $ino_file"
+        # Handle repository dispatch
+        if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+          SKETCH_NAME="${{ github.event.client_payload.filename }}"
+          echo "Compiling specific sketch: $SKETCH_NAME"
           
-          # Get sketch name
-          sketch_name=$(basename "$ino_file" .ino)
-          echo "Compiling: $sketch_name"
+          # Find the sketch file
+          SKETCH_PATH=$(find sketches -name "${SKETCH_NAME}.ino" -type f | head -1)
           
-          # Create proper structure
-          mkdir -p "$sketch_name"
-          cp "$ino_file" "$sketch_name/$sketch_name.ino"
+          if [ -z "$SKETCH_PATH" ]; then
+            echo "Error: Sketch ${SKETCH_NAME}.ino not found"
+            exit 1
+          fi
           
-          # Compile
-          mkdir -p "builds/$sketch_name"
-          arduino-cli compile --fqbn arduino:avr:uno "$sketch_name" --output-dir "builds/$sketch_name" --export-binaries
+          # Compile the specific sketch
+          echo "Found sketch at: $SKETCH_PATH"
+          SKETCH_DIR=$(dirname "$SKETCH_PATH")
           
-          # Cleanup
-          rm -rf "$sketch_name"
-        done
+          # Arduino CLI needs the sketch in a folder with the same name
+          mkdir -p "builds/${SKETCH_NAME}"
+          
+          # Compile and export binaries
+          arduino-cli compile \
+            --fqbn arduino:avr:uno \
+            "$SKETCH_DIR" \
+            --output-dir "builds/${SKETCH_NAME}" \
+            --export-binaries \
+            --verbose
+          
+          # Rename the hex file to a consistent format
+          if [ -f "builds/${SKETCH_NAME}/${SKETCH_NAME}.ino.hex" ]; then
+            cp "builds/${SKETCH_NAME}/${SKETCH_NAME}.ino.hex" "builds/${SKETCH_NAME}/${SKETCH_NAME}.hex"
+            echo "Created: builds/${SKETCH_NAME}/${SKETCH_NAME}.hex"
+          fi
+          
+        else
+          # Compile all sketches
+          echo "Compiling all sketches..."
+          
+          for sketch_dir in sketches/*/; do
+            if [ -d "$sketch_dir" ]; then
+              sketch_name=$(basename "$sketch_dir")
+              echo "Compiling: $sketch_name"
+              
+              mkdir -p "builds/$sketch_name"
+              
+              arduino-cli compile \
+                --fqbn arduino:avr:uno \
+                "$sketch_dir" \
+                --output-dir "builds/$sketch_name" \
+                --export-binaries \
+                --verbose || echo "Failed to compile $sketch_name"
+              
+              # Rename for consistency
+              if [ -f "builds/$sketch_name/${sketch_name}.ino.hex" ]; then
+                cp "builds/$sketch_name/${sketch_name}.ino.hex" "builds/$sketch_name/${sketch_name}.hex"
+              fi
+            fi
+          done
+        fi
         
-        # Show results
-        find builds/ -name "*.hex" -type f
+        # List all hex files
+        echo "Generated hex files:"
+        find builds -name "*.hex" -type f
     
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: firmware
-        path: builds/**/*.hex
-    
-    - name: Commit files
+    - name: Commit compiled files
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
         git add builds/
-        git commit -m "Add firmware [skip ci]" || echo "Nothing to commit"
-        git push || echo "Nothing to push"
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Add compiled firmware for ${{ github.event.client_payload.filename || 'sketches' }} [skip ci]"
+          git push
+        fi
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: compiled-firmware
+        path: builds/**/*.hex
+        retention-days: 7
