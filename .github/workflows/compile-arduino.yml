@@ -19,7 +19,7 @@ jobs:
     - name: Setup Arduino CLI
       uses: arduino/setup-arduino-cli@v1
       with:
-        version: '1.0.4'
+        version: 'latest'
     
     - name: Update Arduino CLI core index
       run: |
@@ -44,14 +44,16 @@ jobs:
       run: |
         echo "🔍 Available sketches:"
         find sketches/ -name "*.ino" -type f || echo "No sketches found"
+        echo "📁 Directory structure:"
+        ls -la sketches/ || echo "Sketches directory not found"
     
-    - name: Compile Arduino sketches
+    - name: Compile Arduino sketches  
       run: |
         echo "🔨 Starting Arduino compilation..."
         mkdir -p builds
         
         if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-          # Single sketch from web IDE
+          # Web IDE triggered compilation
           SKETCH_NAME="${{ github.event.client_payload.filename }}"
           FQBN="${{ github.event.client_payload.fqbn }}"
           
@@ -59,14 +61,14 @@ jobs:
           echo "📝 Sketch: $SKETCH_NAME"
           echo "🎯 Board: $FQBN"
           
-          # Look for the sketch file
+          # Look for the sketch file in multiple locations
           SKETCH_FILE=""
           if [ -f "sketches/$SKETCH_NAME/$SKETCH_NAME.ino" ]; then
             SKETCH_FILE="sketches/$SKETCH_NAME/$SKETCH_NAME.ino"
-            SKETCH_DIR="sketches/$SKETCH_NAME"
+            echo "✅ Found sketch: $SKETCH_FILE (directory structure)"
           elif [ -f "sketches/$SKETCH_NAME.ino" ]; then
             SKETCH_FILE="sketches/$SKETCH_NAME.ino"
-            SKETCH_DIR="sketches"
+            echo "✅ Found sketch: $SKETCH_FILE (flat structure)"
           else
             echo "❌ Sketch file not found!"
             echo "Looking for: sketches/$SKETCH_NAME/$SKETCH_NAME.ino or sketches/$SKETCH_NAME.ino"
@@ -75,42 +77,45 @@ jobs:
             exit 1
           fi
           
-          echo "✅ Found sketch: $SKETCH_FILE"
+          # Create proper Arduino CLI structure: sketch_name/sketch_name.ino
+          COMPILE_DIR="$SKETCH_NAME"
+          mkdir -p "$COMPILE_DIR"
+          cp "$SKETCH_FILE" "$COMPILE_DIR/$SKETCH_NAME.ino"
           
-          # Create proper directory structure for Arduino CLI
-          TEMP_DIR="temp_$SKETCH_NAME"
-          mkdir -p "$TEMP_DIR"
-          cp "$SKETCH_FILE" "$TEMP_DIR/$SKETCH_NAME.ino"
+          echo "🏗️ Created compilation structure: $COMPILE_DIR/$SKETCH_NAME.ino"
           
-          # Copy any additional files from the sketch directory
-          if [ -d "sketches/$SKETCH_NAME" ]; then
-            find "sketches/$SKETCH_NAME" -name "*.cpp" -o -name "*.h" | while read file; do
-              cp "$file" "$TEMP_DIR/"
+          # Copy any additional files (*.h, *.cpp) if they exist
+          SKETCH_DIR=$(dirname "$SKETCH_FILE")
+          if [ -d "$SKETCH_DIR" ] && [ "$SKETCH_DIR" != "sketches" ]; then
+            find "$SKETCH_DIR" -name "*.cpp" -o -name "*.h" | while read file; do
+              cp "$file" "$COMPILE_DIR/" && echo "📋 Copied: $(basename "$file")"
             done
           fi
-          
-          echo "🔨 Compiling $SKETCH_NAME for $FQBN..."
           
           # Compile the sketch
           mkdir -p "builds/$SKETCH_NAME"
           
+          echo "🔨 Compiling $SKETCH_NAME for $FQBN..."
           if arduino-cli compile \
             --fqbn "$FQBN" \
             --output-dir "builds/$SKETCH_NAME" \
             --verbose \
             --export-binaries \
-            "$TEMP_DIR"; then
+            "$COMPILE_DIR"; then
             
             echo "✅ Compilation successful!"
-            
-            # List generated files
             echo "📄 Generated files:"
             find "builds/$SKETCH_NAME" -type f -name "*.hex" -o -name "*.bin" -o -name "*.elf"
             
           else
             echo "❌ Compilation failed!"
+            echo "🔍 Checking sketch content:"
+            cat "$COMPILE_DIR/$SKETCH_NAME.ino"
             exit 1
           fi
+          
+          # Clean up
+          rm -rf "$COMPILE_DIR"
           
         else
           # Repository push - compile all sketches
@@ -118,25 +123,24 @@ jobs:
           
           COMPILATION_SUCCESS=false
           
-          # Find all .ino files
           for sketch_file in $(find sketches/ -name "*.ino" -type f); do
             echo "🔍 Processing: $sketch_file"
             
-            # Extract sketch name from filename
             SKETCH_NAME=$(basename "$sketch_file" .ino)
+            echo "📝 Sketch name: $SKETCH_NAME"
             
-            echo "🔨 Compiling: $SKETCH_NAME"
+            # Create proper Arduino CLI structure
+            COMPILE_DIR="$SKETCH_NAME"
+            mkdir -p "$COMPILE_DIR"
+            cp "$sketch_file" "$COMPILE_DIR/$SKETCH_NAME.ino"
             
-            # Create proper directory structure
-            TEMP_DIR="temp_$SKETCH_NAME"
-            mkdir -p "$TEMP_DIR"
-            cp "$sketch_file" "$TEMP_DIR/$SKETCH_NAME.ino"
+            echo "🏗️ Created: $COMPILE_DIR/$SKETCH_NAME.ino"
             
             # Copy any additional files from the same directory
             SKETCH_DIR=$(dirname "$sketch_file")
             if [ -d "$SKETCH_DIR" ] && [ "$SKETCH_DIR" != "sketches" ]; then
               find "$SKETCH_DIR" -name "*.cpp" -o -name "*.h" | while read file; do
-                cp "$file" "$TEMP_DIR/" 2>/dev/null || true
+                cp "$file" "$COMPILE_DIR/" 2>/dev/null && echo "📋 Copied: $(basename "$file")"
               done
             fi
             
@@ -148,18 +152,19 @@ jobs:
               --output-dir "builds/$SKETCH_NAME" \
               --verbose \
               --export-binaries \
-              "$TEMP_DIR"; then
+              "$COMPILE_DIR"; then
               
               echo "✅ Successfully compiled $SKETCH_NAME"
               COMPILATION_SUCCESS=true
               
             else
               echo "❌ Failed to compile $SKETCH_NAME"
-              # Don't fail the entire workflow for one sketch
+              echo "🔍 Sketch content:"
+              cat "$COMPILE_DIR/$SKETCH_NAME.ino" || echo "Could not read sketch file"
             fi
             
             # Clean up temp directory
-            rm -rf "$TEMP_DIR"
+            rm -rf "$COMPILE_DIR"
           done
           
           if [ "$COMPILATION_SUCCESS" = false ]; then
@@ -177,7 +182,7 @@ jobs:
         if [ -z "$HEX_FILES" ]; then
           echo "❌ No .hex files generated!"
           echo "📂 Build directory contents:"
-          find builds/ -type f
+          find builds/ -type f || echo "No files in builds directory"
           exit 1
         fi
         
@@ -245,7 +250,7 @@ jobs:
           
           **Sketch:** `${{ github.event.client_payload.filename }}.ino`  
           **Board:** ${{ github.event.client_payload.fqbn }}  
-          **Compiled:** ${{ steps.date.outputs.date }}  
+          **Compiled:** $(date)
           
           ### 📥 Download Instructions:
           1. Download the `.hex` file below
@@ -271,7 +276,7 @@ jobs:
         if [ "${{ job.status }}" = "success" ]; then
           echo "🎉 Web IDE compilation completed successfully!"
           echo "📱 Firmware ready for download"
-          echo "🔗 Available at:"
+          echo "🔗 Download URLs:"
           find builds/ -name "*.hex" | while read hex_file; do
             echo "   📄 https://github.com/${{ github.repository }}/raw/${{ github.sha }}/$hex_file"
           done
