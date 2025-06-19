@@ -3,7 +3,7 @@
 
 void setup() {
   // Initialize serial communication
-  Serial.begin(9600);  // 57600 for old Nano bootloader
+  Serial.begin(115200);  // 57600 for old Nano bootloader
   
   // Set built-in LED as output
   pinMode(5, OUTPUT);
