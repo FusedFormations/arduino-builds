@@ -5,7 +5,7 @@ const int LED_PIN = 5; // Built-in LED on most Arduino boards
 
 void setup() {
   // Initialize serial communication for debugging
-  Serial.begin(115200);
+  Serial.begin(9600);
   
   // Set LED pin as output
   pinMode(LED_PIN, OUTPUT);
