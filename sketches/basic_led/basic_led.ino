@@ -1,24 +1,23 @@
-// Basic LED Blink Example for Arduino
-// Works with Arduino Uno, Mega, Nano, and other ATmega boards
-
-const int LED_PIN = 5; // Built-in LED on most Arduino boards
+// Arduino LED Blink Example
+// Works on Uno and Nano
 
 void setup() {
-  // Initialize serial communication for debugging
-  Serial.begin(9600);
+  // Initialize serial communication
+  Serial.begin(115200);  // 57600 for old Nano bootloader
   
-  // Set LED pin as output
-  pinMode(LED_PIN, OUTPUT);
+  // Set built-in LED as output
+  pinMode(LED_BUILTIN, OUTPUT);
   
-  Serial.println("LED Blink Example Started");
+  Serial.println("Arduino LED Blink Started");
+  Serial.println("Board: Arduino Uno/Nano");
 }
 
 void loop() {
-  digitalWrite(LED_PIN, HIGH);   // Turn LED on
+  digitalWrite(LED_BUILTIN, HIGH);  // LED on
   Serial.println("LED ON");
-  delay(5000);                    // Wait 500ms
+  delay(1000);                      // Wait 1 second
   
-  digitalWrite(LED_PIN, LOW);    // Turn LED off
+  digitalWrite(LED_BUILTIN, LOW);   // LED off
   Serial.println("LED OFF");
-  delay(5000);                    // Wait 500ms
+  delay(1000);                      // Wait 1 second
 }
