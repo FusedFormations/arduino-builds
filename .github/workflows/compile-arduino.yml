@@ -17,6 +17,26 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
         fetch-depth: 0
     
+    - name: Configure Git
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+    
+    - name: Clean Git State
+      run: |
+        # Handle any uncommitted changes
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+          echo "Found uncommitted changes, stashing them..."
+          git stash push -m "Auto-stash before compilation $(date)"
+        fi
+        
+        # Ensure we're on main branch
+        git checkout main
+        
+        # Force pull latest changes
+        git fetch origin main
+        git reset --hard origin/main
+    
     - name: Install Arduino CLI
       run: |
         curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
@@ -27,17 +47,29 @@ jobs:
     
     - name: Clean up old builds
       run: |
-        # Remove test builds older than 1 hour
+        # Remove builds older than 24 hours to prevent repo bloat
         if [ -d "builds" ]; then
-          find builds -name "test_*" -type d -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+          find builds -type f -name "*.hex" -mtime +1 -delete 2>/dev/null || true
+          find builds -type f -name "*.eep" -mtime +1 -delete 2>/dev/null || true
           
-          # Keep only the 10 most recent builds for each sketch
-          for sketch_type in $(find builds -maxdepth 1 -type d -name "*" ! -name "builds" | sed 's|builds/||' | grep -v "test_" | sort -u); do
-            # Count builds for this sketch type
-            count=$(find builds -name "${sketch_type}*" -type d | wc -l)
-            if [ $count -gt 10 ]; then
-              # Remove oldest ones
-              find builds -name "${sketch_type}*" -type d | sort | head -n -10 | xargs rm -rf
+          # Remove empty directories
+          find builds -type d -empty -delete 2>/dev/null || true
+          
+          # Keep only the 5 most recent builds for each sketch
+          for sketch_dir in $(find builds -maxdepth 1 -type d -name "*" ! -name "builds" | head -20); do
+            sketch_name=$(basename "$sketch_dir")
+            # Skip if it's a test build
+            if [[ "$sketch_name" == test_* ]]; then
+              if [[ $(find "$sketch_dir" -mmin +60 | wc -l) -gt 0 ]]; then
+                rm -rf "$sketch_dir"
+              fi
+              continue
+            fi
+            
+            # Count hex files for this sketch
+            hex_count=$(find "$sketch_dir" -name "*.hex" | wc -l)
+            if [ $hex_count -gt 0 ]; then
+              echo "Keeping recent build: $sketch_name"
             fi
           done
         fi
@@ -48,71 +80,176 @@ jobs:
         
         if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
           SKETCH_NAME="${{ github.event.client_payload.filename }}"
-          echo "Compiling specific sketch: $SKETCH_NAME"
+          BOARD_TYPE="${{ github.event.client_payload.board }}"
           
+          echo "Compiling sketch: $SKETCH_NAME for board: $BOARD_TYPE"
+          
+          # Find the sketch file
           SKETCH_PATH=$(find sketches -name "${SKETCH_NAME}.ino" -type f | head -1)
           
           if [ -z "$SKETCH_PATH" ]; then
-            echo "Error: Sketch ${SKETCH_NAME}.ino not found"
+            echo "Error: Sketch ${SKETCH_NAME}.ino not found in sketches directory"
+            echo "Available sketches:"
+            find sketches -name "*.ino" -type f
             exit 1
           fi
           
           echo "Found sketch at: $SKETCH_PATH"
           SKETCH_DIR=$(dirname "$SKETCH_PATH")
           
-          mkdir -p "builds/${SKETCH_NAME}"
+          # Create build directory
+          BUILD_DIR="builds/${SKETCH_NAME}"
+          mkdir -p "$BUILD_DIR"
           
+          # Map board types to FQBNs
+          case "$BOARD_TYPE" in
+            "uno"|"nano"|"promini")
+              FQBN="arduino:avr:uno"
+              ;;
+            "mega")
+              FQBN="arduino:avr:mega"
+              ;;
+            "leonardo")
+              FQBN="arduino:avr:leonardo"
+              ;;
+            *)
+              FQBN="arduino:avr:uno"  # Default to Uno
+              echo "Unknown board type '$BOARD_TYPE', defaulting to Uno"
+              ;;
+          esac
+          
+          echo "Using FQBN: $FQBN"
+          
+          # Compile the sketch
           arduino-cli compile \
-            --fqbn arduino:avr:uno \
+            --fqbn "$FQBN" \
             "$SKETCH_DIR" \
-            --output-dir "builds/${SKETCH_NAME}" \
+            --output-dir "$BUILD_DIR" \
             --export-binaries \
             --verbose
           
-          if [ -f "builds/${SKETCH_NAME}/${SKETCH_NAME}.ino.hex" ]; then
-            cp "builds/${SKETCH_NAME}/${SKETCH_NAME}.ino.hex" "builds/${SKETCH_NAME}/${SKETCH_NAME}.hex"
-            echo "Created: builds/${SKETCH_NAME}/${SKETCH_NAME}.hex"
+          # Check if compilation was successful
+          if [ $? -eq 0 ]; then
+            echo "Compilation successful!"
+            
+            # Copy and rename hex file for easier access
+            if [ -f "$BUILD_DIR/${SKETCH_NAME}.ino.hex" ]; then
+              cp "$BUILD_DIR/${SKETCH_NAME}.ino.hex" "$BUILD_DIR/${SKETCH_NAME}.hex"
+              echo "Created: $BUILD_DIR/${SKETCH_NAME}.hex"
+            fi
+            
+            # List generated files
+            echo "Generated files:"
+            ls -la "$BUILD_DIR"
+          else
+            echo "Compilation failed!"
+            exit 1
           fi
-        fi
-        
-        echo "Generated hex files:"
-        find builds -name "*.hex" -type f | head -20
-    
-    - name: Commit compiled files
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        
-        # Pull and rebase to get latest changes
-        git pull origin main --rebase --strategy-option=theirs
-        
-        # Add changes
-        git add builds/
-        
-        # Also stage deletions from cleanup
-        git add -A builds/
-        
-        if git diff --staged --quiet; then
-          echo "No changes to commit"
         else
-          git commit -m "Compiled ${{ github.event.client_payload.filename || 'sketches' }} [skip ci]"
-          
-          # Push with retry
-          for i in {1..5}; do
-            if git push origin main; then
-              echo "Successfully pushed"
-              break
-            else
-              echo "Push attempt $i failed, pulling and retrying..."
-              git pull origin main --rebase --strategy-option=theirs
-              sleep $((i * 2))
+          echo "Triggered by push - compiling all changed sketches"
+          # Handle push events by compiling changed sketches
+          for ino_file in $(git diff --name-only HEAD~1 HEAD | grep '\.ino$'); do
+            if [ -f "$ino_file" ]; then
+              sketch_name=$(basename "$ino_file" .ino)
+              sketch_dir=$(dirname "$ino_file")
+              
+              echo "Compiling changed sketch: $sketch_name"
+              
+              mkdir -p "builds/$sketch_name"
+              
+              arduino-cli compile \
+                --fqbn arduino:avr:uno \
+                "$sketch_dir" \
+                --output-dir "builds/$sketch_name" \
+                --export-binaries \
+                --verbose || echo "Failed to compile $sketch_name"
             fi
           done
         fi
+        
+        echo "=== Compilation Summary ==="
+        find builds -name "*.hex" -type f -exec echo "✅ {}" \; | head -10
+    
+    - name: Commit and push results
+      run: |
+        # Add all changes
+        git add builds/
+        git add -A builds/  # Also add deletions
+        
+        # Check if there are changes to commit
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+          exit 0
+        fi
+        
+        # Create commit message
+        if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+          COMMIT_MSG="Compiled ${{ github.event.client_payload.filename }} for ${{ github.event.client_payload.board }} [skip ci]"
+        else
+          COMMIT_MSG="Compiled sketches from push [skip ci]"
+        fi
+        
+        # Commit changes
+        git commit -m "$COMMIT_MSG"
+        
+        # Push with retry logic
+        for i in {1..5}; do
+          echo "Push attempt $i/5..."
+          
+          if git push origin main; then
+            echo "✅ Successfully pushed compilation results"
+            break
+          else
+            if [ $i -eq 5 ]; then
+              echo "❌ Failed to push after 5 attempts"
+              exit 1
+            fi
+            
+            echo "⚠️ Push failed, pulling latest changes..."
+            
+            # Pull latest changes and rebase our commit
+            git fetch origin main
+            
+            # Check if there are conflicts
+            if git rebase origin/main; then
+              echo "✅ Rebased successfully"
+            else
+              echo "⚠️ Rebase conflicts, resolving..."
+              
+              # For compilation results, prefer our version
+              git checkout --ours builds/
+              git add builds/
+              git rebase --continue || true
+            fi
+            
+            # Wait before retry
+            sleep $((i * 2))
+          fi
+        done
     
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: hex-files-${{ github.run_number }}
         path: builds/**/*.hex
-        retention-days: 1
+        retention-days: 7
+        if-no-files-found: warn
+    
+    - name: Report status
+      run: |
+        echo "=== Final Status ==="
+        echo "Compilation completed at: $(date)"
+        
+        if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+          SKETCH_NAME="${{ github.event.client_payload.filename }}"
+          HEX_FILE="builds/${SKETCH_NAME}/${SKETCH_NAME}.hex"
+          
+          if [ -f "$HEX_FILE" ]; then
+            echo "✅ SUCCESS: $HEX_FILE created"
+            echo "File size: $(stat -f%z "$HEX_FILE" 2>/dev/null || stat -c%s "$HEX_FILE") bytes"
+            echo "Available at: https://raw.githubusercontent.com/${{ github.repository }}/main/$HEX_FILE"
+          else
+            echo "❌ ERROR: Expected hex file not found"
+            exit 1
+          fi
+        fi
